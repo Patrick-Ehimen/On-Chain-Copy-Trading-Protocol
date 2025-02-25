@@ -1,124 +1,167 @@
 use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
-declare_id!("BoXJetaQMDEpgBpsqpoiGbKP2gGEDcvUkQPZNdJHqE65");
+declare_id!("DYFBQCkjzYiQ2rKZBEFW45XpoWbibfLZ5NMGCkyu5wsF");
 
-const MAX_TRADERS: usize = 100;
-
-pub mod master_traders {
+#[program]
+pub mod copy_trading {
     use super::*;
 
-    /// Initializes a new trader list with the admin's public key
-    /// and an empty vector for traders.
-    ///
-    /// @param ctx - the context for the Initialize instruction
-    /// @return Result<()> indicating success or failure of the operation
+    // Initialize the main copy trading program account
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        ctx.accounts.trader_list.admin = ctx.accounts.admin.key();
-        ctx.accounts.trader_list.traders = Vec::new();
+        let copy_trading = &mut ctx.accounts.copy_trading;
+        copy_trading.authority = ctx.accounts.authority.key();
+        copy_trading.master_trader_count = 0;
         Ok(())
     }
 
-    /// Adds a new trader to the trader list.
-    ///
-    /// @param ctx - the context for adding a trader,
-    /// which includes references to trader list and admin accounts.
-    /// @param trader - the public key of the trader to be added to the list.
-    /// @return Result<()> indicating success or failure of the operation.
-    pub fn add_trader(ctx: Context<AddTrader>, trader: Pubkey) -> Result<()> {
-        // Check admin authorization
-        if ctx.accounts.admin.key() != ctx.accounts.trader_list.admin {
-            return Err(error!(ErrorCode::NotAdmin));
-        }
+    // Register a new master trader
+    pub fn register_master_trader(
+        ctx: Context<RegisterMasterTrader>,
+        name: String,
+        description: String,
+    ) -> Result<()> {
+        let copy_trading = &mut ctx.accounts.copy_trading;
+        let master_trader = &mut ctx.accounts.master_trader;
 
-        // Check list capacity
-        if ctx.accounts.trader_list.traders.len() >= MAX_TRADERS {
-            return Err(error!(ErrorCode::TraderListFull));
-        }
+        // Set master trader account data
+        master_trader.authority = ctx.accounts.authority.key();
+        master_trader.name = name;
+        master_trader.description = description;
+        master_trader.total_followers = 0;
+        master_trader.total_aum = 0;
 
-        ctx.accounts.trader_list.traders.push(trader);
+        // Increment the master trader counter
+        copy_trading.master_trader_count += 1;
+
         Ok(())
     }
 
-    /// Removes a trader from the trader list.
-    ///
-    /// @param ctx - the context for removing a trader,
-    /// which includes references to trader list and admin accounts.
-    /// @param trader - the public key of the trader to be removed.
-    /// @return Result<()> indicating success or failure of the operation.
-    // Check admin authorization
-    pub fn remove_trader(ctx: Context<RemoveTrader>, trader: Pubkey) -> Result<()> {
-        if ctx.accounts.admin.key() != ctx.accounts.trader_list.admin {
-            return Err(error!(ErrorCode::NotAdmin));
-        }
+    // Allow a user to follow a trader by depositing funds
+    pub fn follow_trader(ctx: Context<FollowTrader>, amount: u64) -> Result<()> {
+        let master_trader = &mut ctx.accounts.master_trader;
+        let follower = &mut ctx.accounts.follower;
 
-        // Find and remove trader
-        let index = ctx
-            .accounts
-            .trader_list
-            .traders
-            .iter()
-            .position(|x| *x == trader)
-            .ok_or(error!(ErrorCode::TraderNotFound))?;
+        // Store the master trader public key first before borrowing master_trader as mutable
+        let master_trader_key = master_trader.key();
 
-        ctx.accounts.trader_list.traders.remove(index);
+        // Transfer tokens from user to the PDA vault
+        let transfer_instruction = Transfer {
+            from: ctx.accounts.user_token_account.to_account_info(),
+            to: ctx.accounts.vault_token_account.to_account_info(),
+            authority: ctx.accounts.user.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            transfer_instruction,
+        );
+
+        token::transfer(cpi_ctx, amount)?;
+
+        // Update follower data
+        follower.user = ctx.accounts.user.key();
+        follower.master_trader = master_trader_key;
+        follower.deposited_amount = amount;
+        follower.active = true;
+
+        // Update master trader stats
+        master_trader.total_followers += 1;
+        master_trader.total_aum += amount;
+
         Ok(())
-    }
-
-    #[error_code]
-    pub enum ErrorCode {
-        /// Error indicating that the caller is not the admin.
-        #[msg("You are not the admin")]
-        NotAdmin,
-        /// Error indicating that the specified trader was not found in the list.
-        #[msg("Trader not found in the list")]
-        TraderNotFound,
-        /// Error indicating that the trader list is full and cannot accept more traders.
-        #[msg("Trader list is full (max 100)")]
-        TraderListFull,
     }
 }
 
-// Account structure for initialization
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    /// Creates a new trader list account, with admin as the payer, and allocates space
-    /// for storing admin's public key, the length of the traders vector, and space for MAX_TRADERS.
     #[account(
         init,
-        payer = admin,
-        space = 8 + 32 + 4 + (32 * MAX_TRADERS)
+        payer = authority,
+        space = 8 + 32 + 8 // discriminator + pubkey + u64
     )]
-    pub trader_list: Account<'info, TraderList>,
+    pub copy_trading: Account<'info, CopyTrading>,
+
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub authority: Signer<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
-/// Data structure for storing the list of traders, managed by an admin.
+#[derive(Accounts)]
+pub struct RegisterMasterTrader<'info> {
+    #[account(mut)]
+    pub copy_trading: Account<'info, CopyTrading>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + 32 + 100 + 200 + 8 + 8 // discriminator + pubkey + name + description + followers + aum
+    )]
+    pub master_trader: Account<'info, MasterTrader>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FollowTrader<'info> {
+    #[account(mut)]
+    pub master_trader: Account<'info, MasterTrader>,
+
+    #[account(
+        init,
+        payer = user,
+        space = 8 + 32 + 32 + 8 + 1, // discriminator + user + master_trader + amount + active
+        seeds = [b"follower", user.key().as_ref(), master_trader.key().as_ref()],
+        bump
+    )]
+    pub follower: Account<'info, Follower>,
+
+    #[account(
+        seeds = [b"vault", user.key().as_ref(), master_trader.key().as_ref()],
+        bump,
+    )]
+    /// CHECK: This is a PDA that acts as a vault
+    pub vault: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub user_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = vault_token_account.owner == vault.key(),
+    )]
+    pub vault_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
 #[account]
-pub struct TraderList {
-    /// The public key of the admin who manages the trader list.
-    pub admin: Pubkey,
-    /// A vector containing public keys of all traders.
-    pub traders: Vec<Pubkey>,
+pub struct CopyTrading {
+    pub authority: Pubkey,
+    pub master_trader_count: u64,
 }
 
-#[derive(Accounts)]
-pub struct AddTrader<'info> {
-    /// The trader list account to which a new trader will be added.
-    /// Must be mutable to allow changes.
-    #[account(mut)]
-    pub trader_list: Account<'info, TraderList>,
-    /// The admin signer that authorizes modifications to the trader list.
-    pub admin: Signer<'info>,
+#[account]
+pub struct MasterTrader {
+    pub authority: Pubkey,
+    pub name: String,
+    pub description: String,
+    pub total_followers: u64,
+    pub total_aum: u64, // Assets under management
 }
 
-#[derive(Accounts)]
-pub struct RemoveTrader<'info> {
-    /// The trader list account from which a trader will be removed.
-    /// Must be mutable to allow changes.
-    #[account(mut)]
-    pub trader_list: Account<'info, TraderList>,
-    /// The admin signer that authorizes modifications to the trader list.
-    pub admin: Signer<'info>,
+#[account]
+pub struct Follower {
+    pub user: Pubkey,
+    pub master_trader: Pubkey,
+    pub deposited_amount: u64,
+    pub active: bool,
 }
