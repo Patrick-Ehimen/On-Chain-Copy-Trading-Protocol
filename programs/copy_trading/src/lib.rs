@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
 declare_id!("DYFBQCkjzYiQ2rKZBEFW45XpoWbibfLZ5NMGCkyu5wsF");
@@ -39,35 +40,31 @@ pub mod copy_trading {
 
     // Allow a user to follow a trader by depositing funds
     pub fn follow_trader(ctx: Context<FollowTrader>, amount: u64) -> Result<()> {
-        let master_trader = &mut ctx.accounts.master_trader;
+        // Initialize the follower account
         let follower = &mut ctx.accounts.follower;
+        follower.user = ctx.accounts.user.key();
+        follower.master_trader = ctx.accounts.master_trader.key();
+        follower.deposited_amount = amount;
+        follower.active = true;
 
-        // Store the master trader public key first before borrowing master_trader as mutable
-        let master_trader_key = master_trader.key();
+        // Update the master trader stats
+        let master_trader = &mut ctx.accounts.master_trader;
+        master_trader.total_followers += 1;
+        master_trader.total_aum += amount;
 
-        // Transfer tokens from user to the PDA vault
-        let transfer_instruction = Transfer {
+        // Get the vault PDA's bump for use in the seeds
+        let bump = ctx.bumps.vault;
+
+        // Transfer tokens from user to vault with a PDA signer
+        let cpi_accounts = Transfer {
             from: ctx.accounts.user_token_account.to_account_info(),
             to: ctx.accounts.vault_token_account.to_account_info(),
             authority: ctx.accounts.user.to_account_info(),
         };
 
-        let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            transfer_instruction,
-        );
+        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
 
         token::transfer(cpi_ctx, amount)?;
-
-        // Update follower data
-        follower.user = ctx.accounts.user.key();
-        follower.master_trader = master_trader_key;
-        follower.deposited_amount = amount;
-        follower.active = true;
-
-        // Update master trader stats
-        master_trader.total_followers += 1;
-        master_trader.total_aum += amount;
 
         Ok(())
     }
@@ -130,17 +127,16 @@ pub struct FollowTrader<'info> {
     #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>,
 
-    #[account(
-        mut,
-        constraint = vault_token_account.owner == vault.key(),
-    )]
-    pub vault_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    /// CHECK: This is the vault token account. We use AccountInfo to avoid owner checks
+    pub vault_token_account: AccountInfo<'info>,
 
     #[account(mut)]
     pub user: Signer<'info>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
 #[account]
